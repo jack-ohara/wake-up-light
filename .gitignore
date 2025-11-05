@@ -1,0 +1,31 @@
+# PlatformIO
+.pio/
+.vscode/
+.clang_complete
+.gcc-flags.json
+
+# Build outputs
+.pioenvs/
+.pioenvs
+.piolibdeps/
+.piolibdeps
+
+# IDE
+.vscode/*
+*.code-workspace
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# User configuration (contains WiFi credentials)
+src/config.h
+
+# Serial monitor logs
+*.log
