@@ -35,6 +35,8 @@ const int SUNRISE_DURATION_MINUTES = 15; // Duration of sunrise fade
 const unsigned long SUNRISE_DURATION_MS = SUNRISE_DURATION_MINUTES * 60 * 1000;
 // Manual fade configuration (milliseconds)
 const unsigned long MANUAL_FADE_MS = 350; // 350 milliseconds fade for manual on/off
+// Auto-off configuration
+const int DEFAULT_AUTO_OFF_MINUTES = 45; // Default time to auto-off after sunrise completes
 
 // ============ GLOBAL VARIABLES ============
 Preferences preferences;
@@ -57,6 +59,11 @@ struct
   int manualStartCool = 0;
   int manualTargetWarm = 0;
   int manualTargetCool = 0;
+  // Auto-off configuration and state
+  bool autoOffEnabled = true;
+  int autoOffMinutes = DEFAULT_AUTO_OFF_MINUTES;
+  unsigned long sunriseCompleteTime = 0;
+  bool autoOffScheduled = false;
 } alarmState;
 
 // ============ FUNCTION DECLARATIONS ============
@@ -77,6 +84,9 @@ void loadAlarmFromStorage();
 void saveAlarmToStorage();
 void updateSunrise();
 void updateManualFade();
+void updateAutoOff();
+void handleSetAutoOff();
+void handleGetAutoOff();
 
 // Smoothstep easing function: starts and ends gently
 static float smoothstepf(float x)
@@ -148,6 +158,7 @@ void loop()
   // Update manual fading (if active) and sunrise logic
   updateManualFade();
   updateSunrise();
+  updateAutoOff(); // Check if auto-off should trigger
   // Faster update interval for smoother fades
   delay(20);
 }
@@ -251,6 +262,10 @@ void setupWebServer()
             { server.send(204); });
   server.on("/toggle-alarm", HTTP_OPTIONS, []()
             { server.send(204); });
+  server.on("/set-auto-off", HTTP_OPTIONS, []()
+            { server.send(204); });
+  server.on("/get-auto-off", HTTP_OPTIONS, []()
+            { server.send(204); });
 
   // Actual endpoint handlers
   server.on("/set-alarm", HTTP_POST, handleSetAlarm);
@@ -259,6 +274,8 @@ void setupWebServer()
   server.on("/manual-off", HTTP_POST, handleManualOff);
   server.on("/set-brightness", HTTP_POST, handleSetBrightness);
   server.on("/toggle-alarm", HTTP_POST, handleToggleAlarm);
+  server.on("/set-auto-off", HTTP_POST, handleSetAutoOff);
+  server.on("/get-auto-off", HTTP_GET, handleGetAutoOff);
   server.on("/status", HTTP_GET, handleStatus);
   server.onNotFound(handleNotFound);
 
@@ -498,12 +515,73 @@ void handleNotFound()
   server.send(404, "text/plain", "Not Found");
 }
 
+void handleSetAutoOff()
+{
+  if (!server.hasArg("plain"))
+  {
+    server.send(400, "text/plain", "No body");
+    return;
+  }
+
+  String body = server.arg("plain");
+
+  // Simple JSON parsing (looking for "enabled" and "minutes")
+  int enabledPos = body.indexOf("\"enabled\":");
+  int minutesPos = body.indexOf("\"minutes\":");
+
+  if (enabledPos == -1 || minutesPos == -1)
+  {
+    server.send(400, "text/plain", "Invalid JSON format");
+    return;
+  }
+
+  // Parse boolean value for enabled
+  bool enabled = false;
+  if (body.indexOf("true", enabledPos) != -1)
+  {
+    enabled = true;
+  }
+  else if (body.indexOf("false", enabledPos) == -1)
+  {
+    server.send(400, "text/plain", "Invalid boolean value for enabled");
+    return;
+  }
+
+  // Parse minutes value
+  int minutes = atoi(body.c_str() + minutesPos + 10);
+
+  if (minutes < 1 || minutes > 1440)
+  {
+    server.send(400, "text/plain", "Invalid minutes value (must be 1-1440)");
+    return;
+  }
+
+  alarmState.autoOffEnabled = enabled;
+  alarmState.autoOffMinutes = minutes;
+  saveAlarmToStorage();
+
+  String response = "{\"autoOffEnabled\":" + String(enabled ? "true" : "false") +
+                    ",\"autoOffMinutes\":" + String(minutes) + "}";
+  server.send(200, "application/json", response);
+
+  Serial.printf("Auto-off: %s (%d minutes)\n", enabled ? "enabled" : "disabled", minutes);
+}
+
+void handleGetAutoOff()
+{
+  String response = "{\"autoOffEnabled\":" + String(alarmState.autoOffEnabled ? "true" : "false") +
+                    ",\"autoOffMinutes\":" + String(alarmState.autoOffMinutes) + "}";
+  server.send(200, "application/json", response);
+}
+
 // ============ STORAGE FUNCTIONS ============
 void saveAlarmToStorage()
 {
   preferences.putInt("alarm_hour", alarmState.hour);
   preferences.putInt("alarm_min", alarmState.minute);
   preferences.putBool("alarm_set", alarmState.isAlarmSet);
+  preferences.putBool("autooff_enabled", alarmState.autoOffEnabled);
+  preferences.putInt("autooff_mins", alarmState.autoOffMinutes);
   Serial.println("Alarm saved to persistent storage");
 }
 
@@ -512,7 +590,10 @@ void loadAlarmFromStorage()
   alarmState.hour = preferences.getInt("alarm_hour", 6);
   alarmState.minute = preferences.getInt("alarm_min", 30);
   alarmState.isAlarmSet = preferences.getBool("alarm_set", false);
+  alarmState.autoOffEnabled = preferences.getBool("autooff_enabled", true);
+  alarmState.autoOffMinutes = preferences.getInt("autooff_mins", DEFAULT_AUTO_OFF_MINUTES);
   Serial.printf("Alarm loaded: %d:%02d (Set: %s)\n", alarmState.hour, alarmState.minute, alarmState.isAlarmSet ? "Yes" : "No");
+  Serial.printf("Auto-off: %s (%d minutes)\n", alarmState.autoOffEnabled ? "enabled" : "disabled", alarmState.autoOffMinutes);
 }
 
 // ============ LED CONTROL FUNCTIONS ============
@@ -571,6 +652,15 @@ void updateSunrise()
     // Sunrise complete - set to target brightness (1023 warm, 409 cool in 10-bit)
     setBrightness(1023, 409);
     alarmState.isSunriseActive = false;
+
+    // Schedule auto-off if enabled
+    if (alarmState.autoOffEnabled)
+    {
+      alarmState.sunriseCompleteTime = millis();
+      alarmState.autoOffScheduled = true;
+      Serial.printf("Auto-off scheduled in %d minutes\n", alarmState.autoOffMinutes);
+    }
+
     Serial.println("Sunrise complete!");
     return;
   }
@@ -628,4 +718,29 @@ void updateManualFade()
   int cool = alarmState.manualStartCool + (int)((alarmState.manualTargetCool - alarmState.manualStartCool) * eased);
 
   setBrightness(warm, cool);
+}
+
+// Update auto-off timer (called from loop)
+void updateAutoOff()
+{
+  if (!alarmState.autoOffScheduled)
+    return;
+
+  unsigned long elapsed = millis() - alarmState.sunriseCompleteTime;
+  unsigned long autoOffDuration = (unsigned long)alarmState.autoOffMinutes * 60 * 1000;
+
+  if (elapsed >= autoOffDuration)
+  {
+    // Time to turn off - start manual fade down to zero
+    alarmState.isManualFadeActive = true;
+    alarmState.manualFadeStartTime = millis();
+    alarmState.manualFadeDuration = MANUAL_FADE_MS;
+    alarmState.manualStartWarm = alarmState.currentWarmBrightness;
+    alarmState.manualStartCool = alarmState.currentCoolBrightness;
+    alarmState.manualTargetWarm = 0;
+    alarmState.manualTargetCool = 0;
+
+    alarmState.autoOffScheduled = false;
+    Serial.println("Auto-off triggered: fading lights off");
+  }
 }
