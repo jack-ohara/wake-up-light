@@ -3,15 +3,16 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <time.h>
+#include <cmath>
 
 // ============ CONFIGURATION ============
-const char* WIFI_SSID = "";
-const char* WIFI_PASSWORD = "";
-const char* NTP_SERVER = "pool.ntp.org";
+const char *WIFI_SSID = "";
+const char *WIFI_PASSWORD = "";
+const char *NTP_SERVER = "pool.ntp.org";
 
 // Timezone configuration using POSIX timezone strings
 // For London (GMT/BST with automatic DST):
-const char* TZ_INFO = "GMT0BST,M3.5.0/1,M10.5.0";
+const char *TZ_INFO = "GMT0BST,M3.5.0/1,M10.5.0";
 
 // Other timezone examples (POSIX format):
 // UTC: "UTC0"
@@ -23,27 +24,38 @@ const char* TZ_INFO = "GMT0BST,M3.5.0/1,M10.5.0";
 // LED Configuration
 const int WARM_PIN = 18;
 const int COOL_PIN = 19;
-const int PWM_FREQ = 1000;                        // 1 kHz PWM frequency
-const int PWM_RESOLUTION = 8;                     // 8-bit resolution (0-255)
+const int PWM_FREQ = 5000;     // 5 kHz PWM frequency (increased for better linearity)
+const int PWM_RESOLUTION = 10; // 10-bit resolution (0-1023) for finer control
 const int PWM_CHANNEL_WARM = 0;
 const int PWM_CHANNEL_COOL = 1;
 
 // Sunrise Configuration
-const int SUNRISE_DURATION_MINUTES = 15;          // Duration of sunrise fade
+const int SUNRISE_DURATION_MINUTES = 15; // Duration of sunrise fade
 const unsigned long SUNRISE_DURATION_MS = SUNRISE_DURATION_MINUTES * 60 * 1000;
+// Manual fade configuration (milliseconds)
+const unsigned long MANUAL_FADE_MS = 3000; // 3 seconds fade for manual on/off
 
 // ============ GLOBAL VARIABLES ============
 Preferences preferences;
 WebServer server(80);
 
-struct {
-  int hour = 6;
+struct
+{
+  int hour = 8;
   int minute = 30;
   bool isAlarmSet = false;
   bool isSunriseActive = false;
   unsigned long sunriseStartTime = 0;
   int currentWarmBrightness = 0;
   int currentCoolBrightness = 0;
+  // Manual fade state
+  bool isManualFadeActive = false;
+  unsigned long manualFadeStartTime = 0;
+  unsigned long manualFadeDuration = 0;
+  int manualStartWarm = 0;
+  int manualStartCool = 0;
+  int manualTargetWarm = 0;
+  int manualTargetCool = 0;
 } alarmState;
 
 // ============ FUNCTION DECLARATIONS ============
@@ -55,16 +67,58 @@ void handleSetAlarm();
 void handleGetAlarm();
 void handleManualOn();
 void handleManualOff();
+void handleSetBrightness();
+void handleToggleAlarm();
 void handleStatus();
 void handleNotFound();
 void loadAlarmFromStorage();
 void saveAlarmToStorage();
 void updateSunrise();
+void updateManualFade();
+
+// Smoothstep easing function: starts and ends gently
+static float smoothstepf(float x)
+{
+  if (x <= 0.0f)
+    return 0.0f;
+  if (x >= 1.0f)
+    return 1.0f;
+  return x * x * (3.0f - 2.0f * x);
+}
+
+// Smoother ease-in-out using a sine curve
+static float easeInOutSine(float x)
+{
+  if (x <= 0.0f)
+    return 0.0f;
+  if (x >= 1.0f)
+    return 1.0f;
+  return 0.5f * (1.0f - cosf(x * M_PI));
+}
+
+// Apply simple gamma correction for perceptual brightness
+// Gamma settings
+const float DEFAULT_GAMMA = 2.2f;
+const float SUNRISE_GAMMA = 1.0f; // linear response during sunrise for smooth fade-up
+
+// applyGamma: map 0-1023 value through gamma correction
+static int applyGamma(int v, float gamma)
+{
+  // clamp
+  if (v <= 0)
+    return 0;
+  if (v >= 1023)
+    return 1023;
+  float normalized = (float)v / 1023.0f;
+  float corrected = powf(normalized, gamma);
+  return (int)(corrected * 1023.0f + 0.5f);
+}
 void setBrightness(int warm, int cool);
 void startSunrise();
 
 // ============ SETUP ============
-void setup() {
+void setup()
+{
   Serial.begin(115200);
   delay(1000);
 
@@ -84,14 +138,19 @@ void setup() {
 }
 
 // ============ MAIN LOOP ============
-void loop() {
+void loop()
+{
   server.handleClient();
+  // Update manual fading (if active) and sunrise logic
+  updateManualFade();
   updateSunrise();
-  delay(100);
+  // Faster update interval for smoother fades
+  delay(20);
 }
 
 // ============ LED SETUP ============
-void setupLED() {
+void setupLED()
+{
   Serial.println("Setting up LED pins...");
 
   // Configure PWM channels
@@ -109,7 +168,8 @@ void setupLED() {
 }
 
 // ============ WiFi SETUP ============
-void setupWiFi() {
+void setupWiFi()
+{
   Serial.print("Connecting to WiFi: ");
   Serial.println(WIFI_SSID);
 
@@ -117,23 +177,28 @@ void setupWiFi() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+  while (WiFi.status() != WL_CONNECTED && attempts < 20)
+  {
     delay(500);
     Serial.print(".");
     attempts++;
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
+  if (WiFi.status() == WL_CONNECTED)
+  {
     Serial.println("\nWiFi connected!");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
-  } else {
+  }
+  else
+  {
     Serial.println("\nFailed to connect to WiFi");
   }
 }
 
 // ============ NTP SETUP ============
-void setupNTP() {
+void setupNTP()
+{
   Serial.println("Setting up NTP time synchronization...");
 
   // Configure time with NTP server and POSIX timezone string (handles DST automatically)
@@ -145,7 +210,8 @@ void setupNTP() {
   Serial.print("Waiting for NTP time sync: ");
   time_t now = time(nullptr);
   int attempts = 0;
-  while (now < 24 * 3600 && attempts < 20) {
+  while (now < 24 * 3600 && attempts < 20)
+  {
     delay(500);
     Serial.print(".");
     now = time(nullptr);
@@ -159,13 +225,36 @@ void setupNTP() {
 }
 
 // ============ WEB SERVER SETUP ============
-void setupWebServer() {
+void setupWebServer()
+{
   Serial.println("Setting up REST API server...");
 
+  // Enable CORS for all responses
+  server.enableCORS(true);
+
+  // OPTIONS handlers for preflight requests
+  server.on("/set-alarm", HTTP_OPTIONS, []()
+            { server.send(204); });
+  server.on("/get-alarm", HTTP_OPTIONS, []()
+            { server.send(204); });
+  server.on("/manual-on", HTTP_OPTIONS, []()
+            { server.send(204); });
+  server.on("/manual-off", HTTP_OPTIONS, []()
+            { server.send(204); });
+  server.on("/status", HTTP_OPTIONS, []()
+            { server.send(204); });
+  server.on("/set-brightness", HTTP_OPTIONS, []()
+            { server.send(204); });
+  server.on("/toggle-alarm", HTTP_OPTIONS, []()
+            { server.send(204); });
+
+  // Actual endpoint handlers
   server.on("/set-alarm", HTTP_POST, handleSetAlarm);
   server.on("/get-alarm", HTTP_GET, handleGetAlarm);
   server.on("/manual-on", HTTP_POST, handleManualOn);
   server.on("/manual-off", HTTP_POST, handleManualOff);
+  server.on("/set-brightness", HTTP_POST, handleSetBrightness);
+  server.on("/toggle-alarm", HTTP_POST, handleToggleAlarm);
   server.on("/status", HTTP_GET, handleStatus);
   server.onNotFound(handleNotFound);
 
@@ -174,8 +263,10 @@ void setupWebServer() {
 }
 
 // ============ WEB HANDLERS ============
-void handleSetAlarm() {
-  if (!server.hasArg("plain")) {
+void handleSetAlarm()
+{
+  if (!server.hasArg("plain"))
+  {
     server.send(400, "text/plain", "No body");
     return;
   }
@@ -186,7 +277,8 @@ void handleSetAlarm() {
   int hourPos = body.indexOf("\"hour\":");
   int minutePos = body.indexOf("\"minute\":");
 
-  if (hourPos == -1 || minutePos == -1) {
+  if (hourPos == -1 || minutePos == -1)
+  {
     server.send(400, "text/plain", "Invalid JSON format");
     return;
   }
@@ -194,7 +286,8 @@ void handleSetAlarm() {
   int hour = atoi(body.c_str() + hourPos + 7);
   int minute = atoi(body.c_str() + minutePos + 9);
 
-  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59)
+  {
     server.send(400, "text/plain", "Invalid time values");
     return;
   }
@@ -211,26 +304,137 @@ void handleSetAlarm() {
   Serial.println(response);
 }
 
-void handleGetAlarm() {
+void handleGetAlarm()
+{
   String response = "{\"hour\":" + String(alarmState.hour) + ",\"minute\":" + String(alarmState.minute) + ",\"isSet\":" + (alarmState.isAlarmSet ? "true" : "false") + "}";
   server.send(200, "application/json", response);
 }
 
-void handleManualOn() {
+void handleManualOn()
+{
+  // Cancel sunrise and start a manual fade up to full brightness
   alarmState.isSunriseActive = false;
-  setBrightness(255, 255);
-  server.send(200, "text/plain", "Lights turned on");
-  Serial.println("Manual: Lights turned on");
+  alarmState.isManualFadeActive = true;
+  alarmState.manualFadeStartTime = millis();
+  alarmState.manualFadeDuration = MANUAL_FADE_MS;
+  alarmState.manualStartWarm = alarmState.currentWarmBrightness;
+  alarmState.manualStartCool = alarmState.currentCoolBrightness;
+  alarmState.manualTargetWarm = 1023;
+  alarmState.manualTargetCool = 1023;
+
+  server.send(200, "text/plain", "Lights fading on");
+  Serial.println("Manual: fading lights on");
 }
 
-void handleManualOff() {
+void handleManualOff()
+{
+  // Cancel sunrise and start a manual fade down to zero
   alarmState.isSunriseActive = false;
-  setBrightness(0, 0);
-  server.send(200, "text/plain", "Lights turned off");
-  Serial.println("Manual: Lights turned off");
+  alarmState.isManualFadeActive = true;
+  alarmState.manualFadeStartTime = millis();
+  alarmState.manualFadeDuration = MANUAL_FADE_MS;
+  alarmState.manualStartWarm = alarmState.currentWarmBrightness;
+  alarmState.manualStartCool = alarmState.currentCoolBrightness;
+  alarmState.manualTargetWarm = 0;
+  alarmState.manualTargetCool = 0;
+
+  server.send(200, "text/plain", "Lights fading off");
+  Serial.println("Manual: fading lights off");
 }
 
-void handleStatus() {
+void handleSetBrightness()
+{
+  if (!server.hasArg("plain"))
+  {
+    server.send(400, "text/plain", "No body");
+    return;
+  }
+
+  String body = server.arg("plain");
+
+  // Simple JSON parsing (looking for "warm" and "cool")
+  int warmPos = body.indexOf("\"warm\":");
+  int coolPos = body.indexOf("\"cool\":");
+
+  if (warmPos == -1 || coolPos == -1)
+  {
+    server.send(400, "text/plain", "Invalid JSON format");
+    return;
+  }
+
+  int warm = atoi(body.c_str() + warmPos + 7);
+  int cool = atoi(body.c_str() + coolPos + 7);
+
+  if (warm < 0 || warm > 1023 || cool < 0 || cool > 1023)
+  {
+    server.send(400, "text/plain", "Invalid brightness values (must be 0-1023)");
+    return;
+  }
+
+  // Cancel any active sunrise or manual fade
+  alarmState.isSunriseActive = false;
+  alarmState.isManualFadeActive = false;
+
+  // Set brightness immediately
+  setBrightness(warm, cool);
+
+  String response = "{\"warm\":" + String(warm) + ",\"cool\":" + String(cool) + "}";
+  server.send(200, "application/json", response);
+
+  Serial.printf("Brightness set: warm=%d cool=%d\n", warm, cool);
+}
+
+void handleToggleAlarm()
+{
+  if (!server.hasArg("plain"))
+  {
+    server.send(400, "text/plain", "No body");
+    return;
+  }
+
+  String body = server.arg("plain");
+
+  // Simple JSON parsing (looking for "enabled")
+  int enabledPos = body.indexOf("\"enabled\":");
+
+  if (enabledPos == -1)
+  {
+    server.send(400, "text/plain", "Invalid JSON format");
+    return;
+  }
+
+  // Parse boolean value
+  bool enabled = false;
+  if (body.indexOf("true", enabledPos) != -1)
+  {
+    enabled = true;
+  }
+  else if (body.indexOf("false", enabledPos) == -1)
+  {
+    server.send(400, "text/plain", "Invalid boolean value for enabled");
+    return;
+  }
+
+  alarmState.isAlarmSet = enabled;
+
+  // If disabling, cancel any active sunrise
+  if (!enabled)
+  {
+    alarmState.isSunriseActive = false;
+  }
+
+  saveAlarmToStorage();
+
+  String response = "{\"isAlarmSet\":" + String(enabled ? "true" : "false") +
+                    ",\"alarmTime\":\"" + String(alarmState.hour) + ":" +
+                    String(alarmState.minute < 10 ? "0" : "") + String(alarmState.minute) + "\"}";
+  server.send(200, "application/json", response);
+
+  Serial.printf("Alarm %s\n", enabled ? "enabled" : "disabled");
+}
+
+void handleStatus()
+{
   time_t now = time(nullptr);
   struct tm timeinfo = *localtime(&now);
 
@@ -249,19 +453,22 @@ void handleStatus() {
   server.send(200, "application/json", response);
 }
 
-void handleNotFound() {
+void handleNotFound()
+{
   server.send(404, "text/plain", "Not Found");
 }
 
 // ============ STORAGE FUNCTIONS ============
-void saveAlarmToStorage() {
+void saveAlarmToStorage()
+{
   preferences.putInt("alarm_hour", alarmState.hour);
   preferences.putInt("alarm_min", alarmState.minute);
   preferences.putBool("alarm_set", alarmState.isAlarmSet);
   Serial.println("Alarm saved to persistent storage");
 }
 
-void loadAlarmFromStorage() {
+void loadAlarmFromStorage()
+{
   alarmState.hour = preferences.getInt("alarm_hour", 6);
   alarmState.minute = preferences.getInt("alarm_min", 30);
   alarmState.isAlarmSet = preferences.getBool("alarm_set", false);
@@ -269,58 +476,116 @@ void loadAlarmFromStorage() {
 }
 
 // ============ LED CONTROL FUNCTIONS ============
-void setBrightness(int warm, int cool) {
-  // Clamp values to 0-255
-  warm = constrain(warm, 0, 255);
-  cool = constrain(cool, 0, 255);
+void setBrightness(int warm, int cool)
+{
+  // Clamp values to 0-1023 (10-bit resolution)
+  warm = constrain(warm, 0, 1023);
+  cool = constrain(cool, 0, 1023);
 
   alarmState.currentWarmBrightness = warm;
   alarmState.currentCoolBrightness = cool;
 
-  ledcWrite(PWM_CHANNEL_WARM, warm);
-  ledcWrite(PWM_CHANNEL_COOL, cool);
+  // Choose gamma depending on whether we're in sunrise mode (tweak perceptual curve)
+  float gamma = alarmState.isSunriseActive ? SUNRISE_GAMMA : DEFAULT_GAMMA;
+  int pwmWarm = applyGamma(warm, gamma);
+  int pwmCool = applyGamma(cool, gamma);
+
+  ledcWrite(PWM_CHANNEL_WARM, pwmWarm);
+  ledcWrite(PWM_CHANNEL_COOL, pwmCool);
 }
 
 // ============ SUNRISE LOGIC ============
-void startSunrise() {
+void startSunrise()
+{
   Serial.println("Starting sunrise...");
   alarmState.isSunriseActive = true;
   alarmState.sunriseStartTime = millis();
 }
 
-void updateSunrise() {
-  if (!alarmState.isSunriseActive) {
-    // Check if we need to start sunrise
-    if (!alarmState.isAlarmSet) {
+void updateSunrise()
+{
+  // If sunrise not active, check whether we should start it
+  if (!alarmState.isSunriseActive)
+  {
+    if (!alarmState.isAlarmSet)
+    {
       return;
     }
 
     time_t now = time(nullptr);
     struct tm timeinfo = *localtime(&now);
 
-    if (timeinfo.tm_hour == alarmState.hour && timeinfo.tm_min == alarmState.minute) {
+    if (timeinfo.tm_hour == alarmState.hour && timeinfo.tm_min == alarmState.minute)
+    {
       startSunrise();
+      Serial.println("Sunrise started");
     }
     return;
   }
 
-  // Sunrise is active - update brightness
+  // Sunrise is active - update brightness progressively using easing
   unsigned long elapsedTime = millis() - alarmState.sunriseStartTime;
 
-  if (elapsedTime >= SUNRISE_DURATION_MS) {
-    // Sunrise complete - set to full warm light
-    setBrightness(255, 0);
+  if (elapsedTime >= SUNRISE_DURATION_MS)
+  {
+    // Sunrise complete - set to target brightness (1023 warm, 409 cool in 10-bit)
+    setBrightness(1023, 409);
     alarmState.isSunriseActive = false;
     Serial.println("Sunrise complete!");
     return;
   }
 
-  // Calculate brightness levels
-  // Start with cool light (dawn), transition to warm light (sunrise)
-  float progress = (float)elapsedTime / SUNRISE_DURATION_MS;
+  // Normalized progress 0.0 .. 1.0
+  float progress = (float)elapsedTime / (float)SUNRISE_DURATION_MS;
+  if (progress < 0.0f)
+    progress = 0.0f;
+  if (progress > 1.0f)
+    progress = 1.0f;
 
-  int coolBrightness = (int)(255 * (1.0 - progress));      // Cool fades out
-  int warmBrightness = (int)(255 * progress);                // Warm fades in
+  // Simple linear fade from (0, 0) to (1023, 409) in 10-bit resolution
+  int warmBrightness = (int)(1023.0f * progress);
+  int coolBrightness = (int)(409.0f * progress);
 
   setBrightness(warmBrightness, coolBrightness);
+
+  // Throttled debug printing (every ~5s) to avoid flooding serial
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 5000)
+  {
+    Serial.printf("Sunrise progress: %.1f%% warm=%d cool=%d\n", progress * 100.0f, warmBrightness, coolBrightness);
+    lastPrint = millis();
+  }
+}
+
+// Update manual fade effect (called from loop)
+void updateManualFade()
+{
+  if (!alarmState.isManualFadeActive)
+    return;
+
+  unsigned long elapsed = millis() - alarmState.manualFadeStartTime;
+  unsigned long duration = alarmState.manualFadeDuration;
+
+  if (duration == 0 || elapsed >= duration)
+  {
+    // Finish immediately
+    setBrightness(alarmState.manualTargetWarm, alarmState.manualTargetCool);
+    alarmState.isManualFadeActive = false;
+    Serial.println("Manual fade complete");
+    return;
+  }
+
+  float progress = (float)elapsed / (float)duration;
+  if (progress < 0.0f)
+    progress = 0.0f;
+  if (progress > 1.0f)
+    progress = 1.0f;
+
+  // Use ease-in-out sine easing for a gentler ramp
+  float eased = easeInOutSine(progress);
+
+  int warm = alarmState.manualStartWarm + (int)((alarmState.manualTargetWarm - alarmState.manualStartWarm) * eased);
+  int cool = alarmState.manualStartCool + (int)((alarmState.manualTargetCool - alarmState.manualStartCool) * eased);
+
+  setBrightness(warm, cool);
 }
